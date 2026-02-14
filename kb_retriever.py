@@ -15,6 +15,29 @@ logger = logging.getLogger(__name__)
 # ID de la database KB dans Notion
 KB_DATABASE_ID = os.getenv("NOTION_KB_DATABASE_ID", "9a6fb1778ff040d0a28279e32fe91ff2")
 
+# Mots vides a ignorer dans la recherche
+STOP_WORDS = {
+    # Francais courant
+    "comment", "faire", "pour", "dans", "avec", "sans", "entre", "cette",
+    "sont", "sera", "suis", "etre", "avoir", "fait", "faut", "peut",
+    "dois", "doit", "veux", "veut", "quel", "quelle", "quels", "quelles",
+    "quand", "combien", "pourquoi", "quel", "aussi", "bien", "comme",
+    "plus", "moins", "tres", "tout", "tous", "toute", "toutes",
+    "mais", "donc", "encore", "depuis", "avant", "apres", "pendant",
+    "voici", "voila", "autre", "autres", "meme", "notre", "votre", "leur",
+    "chez", "vers", "sous", "dessus", "dessous",
+    # Determinants et pronoms
+    "elle", "elles", "nous", "vous", "ils", "leur", "leurs",
+    "celui", "celle", "ceux", "celles",
+    # Formulations de demande
+    "possible", "besoin", "bonjour", "hello", "salut", "merci",
+    "svp", "equipe", "team", "quelqu",
+    # Anglais courant
+    "what", "when", "where", "which", "that", "this", "from",
+    "have", "will", "been", "would", "could", "should",
+    "about", "there", "their", "them", "they", "some",
+}
+
 
 class KBRetriever:
     """Recupere les entrees pertinentes de la KB Notion."""
@@ -48,8 +71,13 @@ class KBRetriever:
         # Si pas assez de resultats, fallback sur la recherche globale
         if len(results) < 3:
             try:
+                # Utiliser les mots significatifs pour la recherche globale
+                search_query = " ".join(self._extract_significant_words(query)[:3])
+                if not search_query:
+                    search_query = query
+
                 response = self.notion.search(
-                    query=query,
+                    query=search_query,
                     filter={"value": "page", "property": "object"},
                     page_size=max_results,
                 )
@@ -97,12 +125,55 @@ class KBRetriever:
 
         return all_entries
 
+    def check_similar_entry_exists(self, question: str) -> bool:
+        """
+        Verifie si une entree similaire existe deja dans la KB avant d'en creer une nouvelle.
+        Cherche par mots significatifs dans le titre.
+        """
+        keywords = self._extract_significant_words(question)[:2]
+        if not keywords:
+            return False
+
+        try:
+            # Chercher dans les titres existants
+            filters = []
+            for kw in keywords:
+                filters.append({
+                    "property": "Name",
+                    "title": {"contains": kw},
+                })
+
+            # Si tous les mots-cles matchent un titre, c'est probablement un doublon
+            if len(filters) == 1:
+                notion_filter = filters[0]
+            else:
+                notion_filter = {"and": filters}
+
+            response = self.notion.databases.query(
+                database_id=self.db_id,
+                filter=notion_filter,
+                page_size=3,
+            )
+            results = response.get("results", [])
+            if results:
+                logger.info(f"Entree similaire trouvee: {results[0].get('properties', {}).get('Name', {})}")
+                return True
+        except Exception as e:
+            logger.warning(f"Erreur verification doublon: {e}")
+
+        return False
+
     def create_placeholder_entry(self, question: str, category: str = "", detected_topic: str = "") -> Optional[dict]:
         """
         Cree une entree placeholder dans la KB quand le bot ne connait pas la reponse.
-        L'entree est creee avec un process vide, a remplir par l'equipe.
-        Retourne l'entree creee (avec URL Notion) ou None si erreur.
+        Verifie d'abord qu'une entree similaire n'existe pas deja.
+        Retourne l'entree creee (avec URL Notion) ou None si doublon ou erreur.
         """
+        # Verification anti-doublon
+        if self.check_similar_entry_exists(question):
+            logger.info(f"Entree similaire deja existante pour: {question[:50]}. Pas de creation.")
+            return None
+
         title = detected_topic if detected_topic else question[:80]
         today = datetime.now().strftime("%Y-%m-%d")
 
@@ -117,7 +188,7 @@ class KBRetriever:
                 "rich_text": [{"text": {"content": "⚠️ À COMPLÉTER — Process non documenté"}}]
             },
             "Mots-clés": {
-                "rich_text": [{"text": {"content": ", ".join(self._extract_keywords(question))}}]
+                "rich_text": [{"text": {"content": ", ".join(self._extract_significant_words(question))}}]
             },
             "Niveau de confiance": {
                 "select": {"name": "Basse"}
@@ -134,7 +205,7 @@ class KBRetriever:
         if category:
             properties["Catégorie"] = {"select": {"name": category}}
 
-        # Ajouter "Agent" dans Qui resout (a completer par l'equipe)
+        # Ajouter les personnes a contacter
         properties["Qui résout"] = {
             "multi_select": [{"name": "Paul-Henri"}, {"name": "Constantin"}]
         }
@@ -155,28 +226,33 @@ class KBRetriever:
             logger.error(f"Erreur creation entree KB : {e}")
             return None
 
-    def _extract_keywords(self, text: str) -> list[str]:
-        """Extrait les mots significatifs d'un texte pour les mots-cles."""
-        stop_words = {
-            "comment", "faire", "pour", "dans", "avec", "est", "que", "qui",
-            "les", "des", "une", "sur", "pas", "plus", "peut", "son", "ses",
-            "aux", "par", "quoi", "quel", "quelle", "quand", "nous", "vous",
-            "ils", "elle", "elles", "leur", "entre", "cette", "ces", "lui",
-            "comme", "mais", "donc", "car", "the", "and", "how", "what",
-        }
-        words = text.lower().split()
-        return [w for w in words if len(w) > 3 and w not in stop_words][:6]
+    def _extract_significant_words(self, text: str) -> list[str]:
+        """Extrait les mots significatifs d'un texte (filtre les stop words)."""
+        # Nettoyer la ponctuation
+        clean = text.lower()
+        for char in "?!.,;:()[]{}\"'/-–—":
+            clean = clean.replace(char, " ")
+
+        words = clean.split()
+        return [w for w in words if len(w) > 2 and w not in STOP_WORDS][:6]
 
     def _build_text_filter(self, query: str) -> dict:
         """
         Construit un filtre OR sur les champs textuels.
         Cherche dans : Name, Mots-cles, Description, Sous-categorie.
+        Utilise les mots significatifs (pas les stop words).
         """
-        words = query.lower().split()
-        # Prendre les 3 mots les plus significatifs (> 3 chars)
-        keywords = [w for w in words if len(w) > 3][:3]
+        keywords = self._extract_significant_words(query)[:4]
+
+        # Fallback : si aucun mot significatif, prendre les mots de + de 2 chars
         if not keywords:
-            keywords = words[:2]
+            words = query.lower().split()
+            keywords = [w for w in words if len(w) > 2][:3]
+
+        if not keywords:
+            keywords = [query.lower()[:20]]
+
+        logger.info(f"Mots-cles de recherche: {keywords}")
 
         filters = []
         for kw in keywords:
