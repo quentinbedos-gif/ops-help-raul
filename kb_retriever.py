@@ -1,11 +1,13 @@
 """
 Module de retrieval de la Knowledge Base Notion.
 Interroge la base Notion KB Help Raul pour trouver les entrees pertinentes.
+Permet aussi de creer des entrees placeholder quand le bot ne connait pas la reponse.
 """
 
 import os
 import logging
 from typing import Optional
+from datetime import datetime
 from notion_client import Client as NotionClient
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,6 @@ class KBRetriever:
         Strategie : recherche dans les champs Mots-cles, Description, et Name.
         Retourne les entrees les plus pertinentes.
         """
-        # Strategie 1 : Recherche textuelle via l'API Notion search
         results = []
 
         try:
@@ -95,6 +96,76 @@ class KBRetriever:
             start_cursor = response.get("next_cursor")
 
         return all_entries
+
+    def create_placeholder_entry(self, question: str, category: str = "", detected_topic: str = "") -> Optional[dict]:
+        """
+        Cree une entree placeholder dans la KB quand le bot ne connait pas la reponse.
+        L'entree est creee avec un process vide, a remplir par l'equipe.
+        Retourne l'entree creee (avec URL Notion) ou None si erreur.
+        """
+        title = detected_topic if detected_topic else question[:80]
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": title}}]
+            },
+            "Description": {
+                "rich_text": [{"text": {"content": f"Question posee sur Slack : {question}"}}]
+            },
+            "Process de résolution": {
+                "rich_text": [{"text": {"content": "⚠️ À COMPLÉTER — Process non documenté"}}]
+            },
+            "Mots-clés": {
+                "rich_text": [{"text": {"content": ", ".join(self._extract_keywords(question))}}]
+            },
+            "Niveau de confiance": {
+                "select": {"name": "Basse"}
+            },
+            "Dernière MAJ": {
+                "date": {"start": today}
+            },
+            "Langue": {
+                "select": {"name": "FR"}
+            },
+        }
+
+        # Ajouter la categorie si detectee
+        if category:
+            properties["Catégorie"] = {"select": {"name": category}}
+
+        # Ajouter "Agent" dans Qui resout (a completer par l'equipe)
+        properties["Qui résout"] = {
+            "multi_select": [{"name": "Paul-Henri"}, {"name": "Constantin"}]
+        }
+
+        try:
+            response = self.notion.pages.create(
+                parent={"database_id": self.db_id},
+                properties=properties,
+            )
+            logger.info(f"Entree KB placeholder creee : {title}")
+            return {
+                "id": response["id"],
+                "url": response.get("url", ""),
+                "name": title,
+                "status": "created",
+            }
+        except Exception as e:
+            logger.error(f"Erreur creation entree KB : {e}")
+            return None
+
+    def _extract_keywords(self, text: str) -> list[str]:
+        """Extrait les mots significatifs d'un texte pour les mots-cles."""
+        stop_words = {
+            "comment", "faire", "pour", "dans", "avec", "est", "que", "qui",
+            "les", "des", "une", "sur", "pas", "plus", "peut", "son", "ses",
+            "aux", "par", "quoi", "quel", "quelle", "quand", "nous", "vous",
+            "ils", "elle", "elles", "leur", "entre", "cette", "ces", "lui",
+            "comme", "mais", "donc", "car", "the", "and", "how", "what",
+        }
+        words = text.lower().split()
+        return [w for w in words if len(w) > 3 and w not in stop_words][:6]
 
     def _build_text_filter(self, query: str) -> dict:
         """
@@ -193,7 +264,9 @@ def format_kb_entries_for_prompt(entries: list[dict]) -> str:
         qui = ", ".join(entry.get("qui_resout", [])) or "Non defini"
         action_crm = "Oui" if entry.get("action_crm") else "Non"
         lien = entry.get("lien", "")
-        lien_str = f"\n   Lien: {lien}" if lien else ""
+        lien_str = f"\n   Lien process: {lien}" if lien else ""
+        notion_url = entry.get("url", "")
+        notion_str = f"\n   Page Notion: {notion_url}" if notion_url else ""
 
         parts.append(
             f"### Entree {i}: {entry['name']}\n"
@@ -205,6 +278,7 @@ def format_kb_entries_for_prompt(entries: list[dict]) -> str:
             f"   Confiance KB: {entry.get('confiance', 'N/A')}\n"
             f"   Frequence: {entry.get('frequence', 'N/A')}"
             f"{lien_str}"
+            f"{notion_str}"
         )
 
     return "\n\n".join(parts)
